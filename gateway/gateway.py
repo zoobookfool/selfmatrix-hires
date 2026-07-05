@@ -390,7 +390,13 @@ def parse_batch_frame(codec_id: int, body: bytes, codec_by_id):
         return None
     off += hdr_blob_len
     payload_blob = body[off:]
-    headers = zlib.decompress(hdr_blob) if hdr_codec == BATCH_HDR_ZLIB else hdr_blob
+    if hdr_codec == BATCH_HDR_ZLIB:
+        try:
+            headers = zlib.decompress(hdr_blob)
+        except zlib.error:
+            return None
+    else:
+        headers = hdr_blob
     if len(headers) != count * JACKTRIP_HEADER_LEN:
         return None
     lens = [struct.unpack_from("!H", lens_bytes, i * 2)[0] for i in range(count)]
@@ -874,6 +880,14 @@ class Gateway:
             for d in datagrams:
                 self._send_single(session, d)
             return
+        except Exception as exc:
+            # Anything else unexpected (e.g. struct/codec-internal errors) --
+            # don't let it propagate to the event loop and silently swallow
+            # the batch; fall back to sending each datagram individually.
+            print(f"[warn] unexpected batch encode error ({exc!r}); sending {len(datagrams)} packets individually", file=sys.stderr)
+            for d in datagrams:
+                self._send_single(session, d)
+            return
         raw_total = sum(len(d) for d in datagrams)
         self.tunnel_transport.sendto(frame, self.peer_tunnel_addr)
         # Attribute the whole batch to the stats counters: N packets, raw
@@ -881,6 +895,7 @@ class Gateway:
         self.stats.packets_relayed += len(datagrams)
         self.stats.bytes_in += raw_total
         self.stats.bytes_out += len(frame)
+        self.stats.maybe_report()
 
     def on_tunnel_datagram(self, frame: bytes, addr):
         """A frame arrived from the peer gateway over the tunnel."""
@@ -901,7 +916,11 @@ class Gateway:
         # A frame carries either one datagram or a batch of N; normalize to a
         # list so the transport-ready / buffering logic below is shared.
         if flags & FLAG_BATCH:
-            datagrams = parse_batch_frame(codec_id, wire, self.codec_by_id)
+            try:
+                datagrams = parse_batch_frame(codec_id, wire, self.codec_by_id)
+            except CodecError as exc:
+                print(f"[warn] batch decode failed for session {port_tag}: {exc}", file=sys.stderr)
+                return
             if datagrams is None:
                 print(f"[warn] malformed batch frame for session {port_tag}, dropping", file=sys.stderr)
                 return
@@ -943,7 +962,14 @@ class Gateway:
         """Close all sockets owned by this gateway on shutdown, so sessions
         are torn down in an orderly way rather than left to event-loop
         teardown (which emits ResourceWarning: unclosed transport noise)."""
+        # Flush any accumulated (not-yet-sent) batches while the tunnel socket
+        # is still open, so shutdown doesn't silently drop the last <N packets
+        # of each session. _flush_batch also cancels the session's flush timer.
         for session in self.sessions.values():
+            try:
+                self._flush_batch(session)
+            except Exception:
+                pass
             if session.batch_timer is not None:
                 session.batch_timer.cancel()
                 session.batch_timer = None

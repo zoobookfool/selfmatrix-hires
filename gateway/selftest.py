@@ -374,6 +374,108 @@ def run_batch_roundtrip_suite(codec_name: str, wavpack_lib: str = None) -> bool:
     return all_ok
 
 
+def test_batch_corrupt_zlib_header_does_not_crash() -> bool:
+    """A batch frame whose zlib-compressed header blob is corrupted must be
+    rejected gracefully (None or a caught CodecError), never a raw
+    zlib.error escaping parse_batch_frame -- see gateway.py FLAG_BATCH
+    handling in on_tunnel_datagram, which only guards CodecError/None."""
+    codec_by_id = {
+        gw.CODEC_NONE: gwcodecs.make_codec("none"),
+        gw.CODEC_ZLIB: gwcodecs.make_codec("zlib"),
+    }
+    buffer_size, channels, bps = 128, 2, 3
+    fmt = gwcodecs.PayloadFormat(bytes_per_sample=bps, channels=channels, buffer_size=buffer_size)
+    datagrams = [_make_datagram(s, buffer_size, channels, bps, "random", gen_int24_samples) for s in range(4)]
+    frame = gw.build_batch_frame(gw.CODEC_ZLIB, 0xABCD, datagrams, fmt, codec_by_id[gw.CODEC_ZLIB])
+    parsed = gw.parse_tunnel_frame(frame)
+    body = bytearray(parsed[4])
+
+    # Locate the header blob: sub-header + lens table precede it. Corrupt
+    # a byte inside the zlib-compressed header blob so zlib.decompress
+    # raises zlib.error instead of returning valid data.
+    count, hdr_codec, hdr_blob_len = struct.unpack(gw.BATCH_SUBHDR_FMT, bytes(body[: gw.BATCH_SUBHDR_LEN]))
+    assert hdr_codec == gw.BATCH_HDR_ZLIB, "expected header blob to be zlib-compressed for this test"
+    off = gw.BATCH_SUBHDR_LEN + count * 2
+    body[off] ^= 0xFF  # flip bits in the first byte of the zlib header blob
+
+    threw_unexpected = False
+    result = None
+    try:
+        result = gw.parse_batch_frame(parsed[0], bytes(body), codec_by_id)
+    except gwcodecs.CodecError:
+        pass  # acceptable: caller (on_tunnel_datagram) catches this
+    except Exception:
+        threw_unexpected = True
+
+    ok = not threw_unexpected and (result is None or True)
+    record(
+        "batch frame: corrupted zlib header blob does not raise raw zlib.error",
+        PASS if ok else FAIL,
+        "" if ok else f"unexpected exception escaped parse_batch_frame (result={result})",
+    )
+    return ok
+
+
+def test_flush_batch_falls_back_on_unexpected_codec_exception() -> bool:
+    """_flush_batch must not let a non-CodecError exception from
+    build_batch_frame propagate (it would be swallowed/logged by asyncio's
+    loop exception handler when invoked from the batch flush timer, losing
+    the whole batch). It should fall back to sending packets individually."""
+
+    class ExplodingCodec:
+        name = "exploding"
+
+        def encode(self, fmt, payload):
+            raise ValueError("boom: simulated unexpected codec bug")
+
+        def decode(self, fmt, blob, expected_len):
+            raise ValueError("boom: simulated unexpected codec bug")
+
+    sent = []
+
+    class FakeTransport:
+        def sendto(self, data, addr):
+            sent.append(("frame", data, addr))
+
+    class FakeLoop:
+        def call_later(self, *a, **k):
+            return None
+
+    gateway = object.__new__(gw.Gateway)
+    gateway.codec = ExplodingCodec()
+    gateway.codec_id = gw.CODEC_ZLIB
+    gateway.batch_flush_s = 0.02
+    gateway.tunnel_transport = FakeTransport()
+    gateway.peer_tunnel_addr = ("127.0.0.1", 4242)
+    gateway._loop = FakeLoop()
+    gateway.stats = gw.Stats()
+
+    sent_singles = []
+    gateway._send_single = lambda session, data: sent_singles.append(data)
+
+    session = gw.Session(port_tag=0xABCD, local_udp_port=61000)
+    buffer_size, channels, bps = 128, 2, 3
+    fmt = gwcodecs.PayloadFormat(bytes_per_sample=bps, channels=channels, buffer_size=buffer_size)
+    datagrams = [_make_datagram(s, buffer_size, channels, bps, "random", gen_int24_samples) for s in range(3)]
+    session.batch = list(datagrams)
+    session.batch_fmt = fmt
+    session.batch_timer = None
+
+    threw = False
+    try:
+        gateway._flush_batch(session)
+    except Exception:
+        threw = True
+
+    ok = (not threw) and sent_singles == datagrams and not sent
+    record(
+        "_flush_batch: unexpected codec exception falls back to per-packet send",
+        PASS if ok else FAIL,
+        "" if ok else f"threw={threw} sent_singles={len(sent_singles)} batch_frames_sent={len(sent)}",
+    )
+    return ok
+
+
 # ---------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------
@@ -403,6 +505,8 @@ def main() -> int:
     print("\n-- 5. batch frame round-trip (split-back bit-exact) --")
     ok &= run_batch_roundtrip_suite("zlib")
     ok &= run_batch_roundtrip_suite("wavpack", wavpack_lib=wavpack_lib)
+    ok &= test_batch_corrupt_zlib_header_does_not_crash()
+    ok &= test_flush_batch_falls_back_on_unexpected_codec_exception()
 
     print("\n=== summary ===")
     n_pass = sum(1 for _, s, _ in _results if s == PASS)

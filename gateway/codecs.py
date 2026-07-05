@@ -119,7 +119,10 @@ class ZlibCodec(Codec):
         return zlib.compress(payload, self.level)
 
     def decode(self, fmt: PayloadFormat, blob: bytes, expected_len: int) -> bytes:
-        out = zlib.decompress(blob)
+        try:
+            out = zlib.decompress(blob)
+        except zlib.error as exc:
+            raise CodecError(f"zlib decode failed: {exc}")
         if len(out) != expected_len:
             raise CodecError(
                 f"zlib decode length mismatch: got {len(out)} expected {expected_len}"
