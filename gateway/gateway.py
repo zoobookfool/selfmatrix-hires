@@ -561,9 +561,17 @@ class Gateway:
         port_tag = hub_udp_port & 0xFFFF
         if port_tag in self.sessions:
             return
-        session = Session(port_tag=port_tag, local_udp_port=0)
+        session = Session(port_tag=port_tag, local_udp_port=hub_udp_port)
         self.sessions[port_tag] = session
-        self._spawn_open_local_udp(session, listen_port=0)
+        # The local JackTrip client sends its UDP audio to (its -C host,
+        # hub_udp_port) -- the port the hub announced in the handshake, which
+        # we relayed through byte-for-byte. To intercept that audio the
+        # client-side gateway must bind that exact port on its own bind_host
+        # (not an ephemeral port). In a real deployment client and hub are on
+        # different machines so this never collides with the hub's own bind;
+        # for single-machine loopback tests use a distinct loopback IP
+        # (e.g. hub on 127.0.0.1, client on 127.0.0.2).
+        self._spawn_open_local_udp(session, listen_port=hub_udp_port)
         print(f"[gateway] client role: learned hub udp port {hub_udp_port} -> session tag {port_tag}", file=sys.stderr)
 
     def _spawn_open_local_udp(self, session: Session, listen_port: int) -> None:
@@ -759,6 +767,19 @@ class Gateway:
         # know its ephemeral source port (mirrors hub's own NAT-learning
         # behavior per protocol facts).
 
+    def close(self) -> None:
+        """Close all sockets owned by this gateway on shutdown, so sessions
+        are torn down in an orderly way rather than left to event-loop
+        teardown (which emits ResourceWarning: unclosed transport noise)."""
+        for t in self._open_udp_tasks:
+            t.cancel()
+        for transport in self._local_transports.values():
+            transport.close()
+        self._local_transports.clear()
+        if self.tunnel_transport is not None:
+            self.tunnel_transport.close()
+            self.tunnel_transport = None
+
 
 # --- CLI ------------------------------------------------------------------
 
@@ -828,6 +849,7 @@ async def async_main(args):
             await t
         except (asyncio.CancelledError, Exception):
             pass
+    gw.close()
 
 
 def main():
