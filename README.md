@@ -3,7 +3,7 @@
 [SelfMatrix](https://github.com/zoobookfool/selfmatrix) (Matrix ベースの Discord 代替) 向けの、**本体とは結合しない独立した拡張モジュール**です。JackTrip (hub mode) で 192kHz/24bit の非圧縮ステレオ音声を VPS 中継します。
 
 - 本体 (Synapse / LiveKit / クライアント fork) には一切依存しません。有効化しなくても SelfMatrix の通話・チャットは通常どおり動作しますし、SelfMatrix を使っていなくても単体で使えます。
-- 設計判断の経緯 (スパイク記録・要件・方針変更) は親プロジェクトの [docs/hires-spike.md](https://github.com/zoobookfool/selfmatrix/blob/main/docs/hires-spike.md)、[docs/requirements.md](https://github.com/zoobookfool/selfmatrix/blob/main/docs/requirements.md) §4/§9、[docs/roadmap.md](https://github.com/zoobookfool/selfmatrix/blob/main/docs/roadmap.md) Phase 6 を参照してください。
+- 要件の正本はこのリポジトリの [docs/requirements.md](docs/requirements.md) (2026-07-06 ゼロベース再定義) です。設計・実装の判断はこのドキュメントを基準にしてください。スパイク記録 (実測値・調査事実の一次資料) は親プロジェクトの [docs/hires-spike.md](https://github.com/zoobookfool/selfmatrix/blob/main/docs/hires-spike.md) を参照してください。
 
 ## 1. これは何か
 
@@ -133,7 +133,20 @@ jacktrip -C <hires ホスト名> -T 192000 -b 24 -n 2 --udprt -R -A \
 
 また、**ハイレゾ hub は同時 1 セッションのみ** (サーバー全体でミックスは 1 つ) を前提にしています。JackTrip hub は接続者全員が同じミックスに入る構造であることに加え、上記の帯域試算のとおり複数セッションを並走させる回線余裕が無いためです。どうしても複数セッションが必要になった場合は `--bind-port` を変えて hub を増設できますが、回線増強とセットで判断してください。
 
-## 6. トラブルシュート
+## 6. セキュリティ上の注意
+
+- **UDP 音声ストリームは暗号化されません (平文です)。** `-A` による認証は接続確立時の TCP ハンドシェイクのみを保護するもので、音声そのものを運ぶ UDP ストリームは暗号化されずに流れます (ソースコード確認済みの事実。[docs/requirements.md](docs/requirements.md) §4.2 参照)。
+- 本系統は SelfMatrix 本体の「通話は E2EE を標準にする」方針の**適用対象外の別系統**です。機微な内容の会話は本体側の E2EE 通話を使ってください。
+- 盗聴・改ざん耐性が必要な場合は WireGuard 等の VPN 併用が選択肢になりますが、遅延が増加するトレードオフがあります (JackTrip 公式は VPN 経由の利用を遅延の観点から非推奨としています)。
+
+## 7. 録音 (収録・録音素材)
+
+録音方式は各参加者のローカル録音 (double-ender 方式) を基本とします。hub (VPS) 側に録音機能はなく、音声データを VPS に残しません ([docs/requirements.md](docs/requirements.md) §4.3 参照)。
+
+- 各自が自分の送信音声 (マイク) と受信ミックスをローカルで録音し、セッション後に持ち寄って編集してください。
+- **運用ルール:** 録音するセッションでは、開始前に全参加者へ録音する旨を告知し、同意を確認してください。同意しない参加者がいる場合は録音しない、またはその参加者の退出後に録音を開始してください。
+
+## 8. トラブルシュート
 
 ### 接続できない
 
