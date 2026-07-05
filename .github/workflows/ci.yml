@@ -11,6 +11,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck (warning 以上を fail に)
-        run: shellcheck --severity=warning provision.sh
+        run: shellcheck --severity=warning provision.sh launcher/connect.sh
       - name: bash -n
-        run: bash -n provision.sh
+        run: |
+          bash -n provision.sh
+          bash -n launcher/connect.sh
+
+  gateway:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: install libwavpack (for wavpack codec coverage)
+        run: sudo apt-get update && sudo apt-get install -y libwavpack1
+      - name: gateway selftest (zlib + wavpack, bit-exact roundtrips)
+        run: |
+          export GATEWAY_WAVPACK_LIB="$(readlink -f /usr/lib/*/libwavpack.so.1 2>/dev/null || ls /usr/lib/*/libwavpack.so.* | head -1)"
+          echo "using libwavpack: $GATEWAY_WAVPACK_LIB"
+          python3 gateway/selftest.py
+      - name: bench_ratio smoke (must run without error)
+        run: |
+          export GATEWAY_WAVPACK_LIB="$(readlink -f /usr/lib/*/libwavpack.so.1 2>/dev/null || ls /usr/lib/*/libwavpack.so.* | head -1)"
+          python3 gateway/bench_ratio.py >/dev/null

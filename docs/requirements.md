@@ -236,7 +236,7 @@ selfmatrix-hires は [SelfMatrix](https://github.com/zoobookfool/selfmatrix) 本
 - exit criteria:
   - JackTrip の UDP ペイロード構造と圧縮データの互換性を検証済み(挟み込みが技術的に成立するか、実質的に別トランスポートの自作が必要かを判定し、設計を確定させている)— **設計レベルで達成(2026-07-06、[docs/stage2-compression-gateway.md](stage2-compression-gateway.md): 案A不成立・案B透過トンネル型を採用)**。実装レベルの裏付けは PoC 段階1で行う
   - 圧縮ゲートウェイが 192kHz/24bit で片道 150ms 以内・実測圧縮率を計測済み
-  - ランチャーで「設定ファイル受け取り→実行」の2ステップ接続が Windows/macOS/Linux それぞれで動作確認済み。ランチャーはこのリポジトリ内のスクリプトのみで完結し、外部サービス・本体リポジトリに依存していないことを確認(2026-07-06 時点: `launcher/` 実装済み・Windows で dry-run 検証済み。macOS/Linux 実機確認と実接続での確認が残)
+  - ランチャーで「設定ファイル受け取り→実行」の2ステップ接続が Windows/macOS/Linux それぞれで動作確認済み。ランチャーはこのリポジトリ内のスクリプトのみで完結し、外部サービス・本体リポジトリに依存していないことを確認(2026-07-06 時点: `launcher/` 実装済み。**Windows(PowerShell 5.1/7)と Linux(WSL、connect.sh)で dry-run・引数組み立て・空白入りデバイス名・HOST 未設定エラーを検証済み。connect.sh は shellcheck 0.9.0 severity=warning でクリーン**。macOS 実機確認と、実 hub での実接続確認が残)
   - VPS を 2GB クラスに引き上げ、RAM 実測が許容範囲内であることを確認
 
 ### Stage 3(384kHz/32bit float 対応 + 人数拡大)
