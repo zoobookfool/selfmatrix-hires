@@ -131,15 +131,26 @@ python3 gateway.py --role client \
   --codec zlib --debug-headers 5
 ```
 
-### 3.4 JackTrip クライアントを起動する(ゲートウェイのlocalhost:4464へ接続)
+### 3.4 JackTrip クライアントを起動する(client 側ゲートウェイへ接続)
 
 ```bash
-JACK_DEFAULT_SERVER=client_srv jacktrip -c 127.0.0.1 -C 4464 -q 8
+# -C は「Hub Client モード + 接続先ホスト」。-c(P2P Client)とは排他なので併用しない。
+# TCP は既定の 4464 番で client 側ゲートウェイ(127.0.0.2)へ繋がる。
+JACK_DEFAULT_SERVER=client_srv jacktrip -C 127.0.0.2 -B 24465 -q 8 -L 127.0.0.2
 ```
 
 接続が成立すると、client 側ゲートウェイの標準エラー出力に
 `client role: learned hub udp port ... -> session tag ...` のログが出て、
-続けて双方向の UDP パケット中継が始まり、5秒おきに統計行が出力されます。
+client→hub 方向の UDP パケット中継が始まり、5秒おきに統計行が出力されます。
+
+### 3.5 検証済みの構成と単一マシンの制限(2026-07-06)
+
+上記手順で実際に検証した結果(§`docs/stage2-compression-gateway.md` §7.1 に詳細):
+
+- **hub 側=127.0.0.1、client 側=127.0.0.2 の IP 分離**が必須。JackTrip は UDP をデュアルスタックのワイルドカード(`[::]:port`)でバインドするため、hub 側と client 側を同一ループバック IP に載せるとポートが衝突する。
+- TCP ハンドシェイク透過中継・両ゲートウェイの session tag 一致・ヘッダ 16byte 素通し(mismatches=0)・zlib/wavpack の可逆圧縮は、実 JackTrip で確認済み(client→hub 方向)。
+- **双方向(hub→client)の完全疎通は単一マシンでは未達**。IP 分離をしても実 hub の `JackTripWorker` が `Could not bind UDP socket` でクラッシュする(client 側ゲートウェイが同ポートを保持するため)。これは実運用(hub=VPS、client=参加者PC の2ホスト)では起きない単一マシン固有の制約であり、双方向の完全検証は段階2(VPS)で行う。
+- `-B` を既定の 4464 から大きくずらすと、hub の UDP base port が連動して 65535 を超え、割当ポートが下位16bitに折り返る(例: `-B 14464` → base 71002 → 通知ポート 5466)。テストでは無害だったが、hub の bind port は既定付近に留めるのが無難。
 
 ## 4. 確認項目(設計文書 §7.1 の5項目との対応)
 
