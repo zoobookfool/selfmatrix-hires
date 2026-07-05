@@ -235,7 +235,7 @@ selfmatrix-hires は [SelfMatrix](https://github.com/zoobookfool/selfmatrix) 本
 - 内容: WavPack ベースの圧縮ゲートウェイ PoC(§4.1)、半自動ランチャー(§4.4)の実装
 - exit criteria:
   - JackTrip の UDP ペイロード構造と圧縮データの互換性を検証済み(挟み込みが技術的に成立するか、実質的に別トランスポートの自作が必要かを判定し、設計を確定させている)— **達成(2026-07-06)**。設計レベルで案A不成立・案B透過トンネル型を採用([docs/stage2-compression-gateway.md](stage2-compression-gateway.md))。実装(gateway/)+ 実 JackTrip 統合テストで裏付け済み。**さらに実 VPS 上の netns 2端点テスト(§7.2)で双方向確立・`mismatches=0`・`--batch 16` を確認**(段階1で未達だった双方向確立が別スタックで成立し、単一マシンのポート衝突が原因だったことを確定)
-  - 圧縮ゲートウェイが 192kHz/24bit で片道 150ms 以内・実測圧縮率を計測済み — バッチ圧縮 N≈16 実装済み(§4.3/§5.1)。**真の2ホスト実 WAN テスト(Windows client ↔ VPS hub over Tailscale)で 192kHz/24bit・384kHz/24bit とも双方向確立・`mismatches=0` を確認、実 WAN RTT ≈9.6ms(150ms に桁の余裕)**(設計文書 §7.3)。残: 32bit float(`-b 32`)、複数クライアント(10人)CPU/RAM、片道遅延の絶対値精密実測、信号量の多い実音源での圧縮率
+  - 圧縮ゲートウェイが 192kHz/24bit で片道 150ms 以内・実測圧縮率を計測済み — バッチ圧縮 N≈16 実装済み(§4.3/§5.1)。**真の2ホスト実 WAN テスト(Windows client ↔ VPS hub over Tailscale)で 192kHz/24bit・384kHz/24bit・そして対応目標の 384kHz/32bit float すべて双方向確立・`mismatches=0` を確認**。384/32f はワイヤ上の BitResolution=32・実効 ≈24.8Mbps・パケットレート理論値一致まで検証。実 WAN RTT ≈9.6ms(150ms に桁の余裕)(設計文書 §7.3)。残: 複数クライアント(10人)CPU/RAM、片道遅延の絶対値精密実測、信号量の多い実音源での圧縮率
   - ランチャーで「設定ファイル受け取り→実行」の2ステップ接続が Windows/macOS/Linux それぞれで動作確認済み。ランチャーはこのリポジトリ内のスクリプトのみで完結し、外部サービス・本体リポジトリに依存していないことを確認(2026-07-06 時点: `launcher/` 実装済み。**Windows(PowerShell 5.1/7)と Linux(WSL、connect.sh)で dry-run・引数組み立て・空白入りデバイス名・HOST 未設定エラーを検証済み。connect.sh は shellcheck 0.9.0 severity=warning でクリーン**。macOS 実機確認と、実 hub での実接続確認が残)
   - VPS を 2GB クラスに引き上げ、RAM 実測が許容範囲内であることを確認
 
