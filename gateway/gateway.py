@@ -120,6 +120,7 @@ import signal
 import struct
 import sys
 import time
+import zlib
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -155,10 +156,19 @@ CODEC_ID_BY_NAME = {"none": CODEC_NONE, "zlib": CODEC_ZLIB, "wavpack": CODEC_WAV
 CODEC_NAME_BY_ID = {v: k for k, v in CODEC_ID_BY_NAME.items()}
 
 FLAG_PASSTHROUGH = 0x01
+FLAG_BATCH = 0x02  # frame body is a batch of N datagrams (see build_batch_frame)
 
 TUNNEL_HDR_FMT = "!2sBBBHH"  # magic, ver, codec, flags, port_tag, orig_len
 TUNNEL_HDR_LEN = struct.calcsize(TUNNEL_HDR_FMT)
 assert TUNNEL_HDR_LEN == 9
+
+# Batch sub-header (follows the 9-byte tunnel header when FLAG_BATCH is set):
+#   count(2) hdr_codec(1) hdr_blob_len(2), then count*2 bytes of per-packet
+#   datagram lengths, then hdr_blob, then the audio-compressed payload blob.
+BATCH_SUBHDR_FMT = "!HBH"  # count, hdr_codec(0=raw,1=zlib), hdr_blob_len
+BATCH_SUBHDR_LEN = struct.calcsize(BATCH_SUBHDR_FMT)
+BATCH_HDR_RAW = 0
+BATCH_HDR_ZLIB = 1
 
 JACKTRIP_HEADER_LEN = 16
 # DefaultHeaderStruct (native byte order, no explicit endian conversion in
@@ -333,6 +343,81 @@ def parse_tunnel_frame(frame: bytes):
     return codec_id, flags, port_tag, orig_len, frame[TUNNEL_HDR_LEN:]
 
 
+def build_batch_frame(codec_id: int, port_tag: int, datagrams, fmt, codec) -> bytes:
+    """Compress N same-format audio datagrams into one FLAG_BATCH frame.
+
+    Headers (16B each, not PCM) and payloads (PCM) are split: payloads are
+    concatenated and compressed with the audio codec as one block (this is
+    what actually reduces bandwidth -- see docs/stage2-compression-gateway.md
+    sec.4.3), while the small header blob is zlib'd (or kept raw if that is
+    smaller). All datagrams must share fmt.channels/bytes_per_sample; the
+    caller (Gateway._flush_batch) guarantees this.
+    """
+    headers = b"".join(d[:JACKTRIP_HEADER_LEN] for d in datagrams)
+    payloads = b"".join(d[JACKTRIP_HEADER_LEN:] for d in datagrams)
+    lens = b"".join(struct.pack("!H", len(d) & 0xFFFF) for d in datagrams)
+    hz = zlib.compress(headers, 1)
+    if len(hz) < len(headers):
+        hdr_codec, hdr_blob = BATCH_HDR_ZLIB, hz
+    else:
+        hdr_codec, hdr_blob = BATCH_HDR_RAW, headers
+    # buffer_size across the whole batch = sum of per-packet buffer_sizes;
+    # channels/bytes_per_sample are constant, so one PayloadFormat describes it.
+    batch_fmt = PayloadFormat(
+        bytes_per_sample=fmt.bytes_per_sample,
+        channels=fmt.channels,
+        buffer_size=fmt.buffer_size * len(datagrams),
+    )
+    payload_blob = codec.encode(batch_fmt, payloads)
+    sub = struct.pack(BATCH_SUBHDR_FMT, len(datagrams) & 0xFFFF, hdr_codec, len(hdr_blob) & 0xFFFF)
+    body = sub + lens + hdr_blob + payload_blob
+    return build_tunnel_frame(codec_id, FLAG_BATCH, port_tag, 0, body)
+
+
+def parse_batch_frame(codec_id: int, body: bytes, codec_by_id):
+    """Inverse of build_batch_frame. Returns a list of reconstructed datagrams,
+    or None if the body is malformed. Payloads are bit-exact with the input."""
+    if len(body) < BATCH_SUBHDR_LEN:
+        return None
+    count, hdr_codec, hdr_blob_len = struct.unpack(BATCH_SUBHDR_FMT, body[:BATCH_SUBHDR_LEN])
+    off = BATCH_SUBHDR_LEN
+    lens_bytes = body[off:off + count * 2]
+    if len(lens_bytes) != count * 2:
+        return None
+    off += count * 2
+    hdr_blob = body[off:off + hdr_blob_len]
+    if len(hdr_blob) != hdr_blob_len:
+        return None
+    off += hdr_blob_len
+    payload_blob = body[off:]
+    headers = zlib.decompress(hdr_blob) if hdr_codec == BATCH_HDR_ZLIB else hdr_blob
+    if len(headers) != count * JACKTRIP_HEADER_LEN:
+        return None
+    lens = [struct.unpack_from("!H", lens_bytes, i * 2)[0] for i in range(count)]
+    payload_lens = [L - JACKTRIP_HEADER_LEN for L in lens]
+    if any(pl < 0 for pl in payload_lens):
+        return None
+    first_hdr = headers[:JACKTRIP_HEADER_LEN]
+    fmt = payload_format_for(first_hdr)
+    if fmt is None:
+        return None
+    total_payload = sum(payload_lens)
+    batch_fmt = PayloadFormat(
+        bytes_per_sample=fmt.bytes_per_sample,
+        channels=fmt.channels,
+        buffer_size=total_payload // (fmt.channels * fmt.bytes_per_sample) if fmt.channels and fmt.bytes_per_sample else 0,
+    )
+    codec = codec_by_id[codec_id]
+    payloads = codec.decode(batch_fmt, payload_blob, total_payload)
+    out = []
+    hoff = poff = 0
+    for i in range(count):
+        h = headers[hoff:hoff + JACKTRIP_HEADER_LEN]; hoff += JACKTRIP_HEADER_LEN
+        p = payloads[poff:poff + payload_lens[i]]; poff += payload_lens[i]
+        out.append(h + p)
+    return out
+
+
 # --- Datagram compression helpers ---------------------------------------
 
 
@@ -385,6 +470,11 @@ class Session:
     local_udp_port: int  # the local (loopback) UDP port this gateway relays for
     peer_addr: Optional[Tuple[str, int]] = None  # tunnel-side remote addr, once known
     local_peer_addr: Optional[Tuple[str, int]] = None  # observed local JackTrip UDP peer addr
+    # Batching (sender side): accumulate same-format audio datagrams until the
+    # count reaches N or the flush timer fires (see Gateway._flush_batch).
+    batch: list = field(default_factory=list)
+    batch_fmt: Optional[PayloadFormat] = None
+    batch_timer: Optional[object] = None  # asyncio TimerHandle, or None
 
 
 class TunnelUdpProtocol(asyncio.DatagramProtocol):
@@ -444,6 +534,13 @@ class Gateway:
         self._local_transports: Dict[int, asyncio.DatagramTransport] = {}
         self._pending_local_frames: Dict[int, list] = {}
         self._open_udp_tasks: set = set()
+        # Batching: compress N same-format audio datagrams together (see
+        # docs/stage2-compression-gateway.md sec.5.1 -- N=1 barely compresses,
+        # N~=16 is the recommended knee). Only active when N>1 and a real
+        # codec is selected; codec='none' and non-audio packets never batch.
+        self.batch_n = max(1, getattr(args, "batch", 1))
+        self.batch_flush_s = max(1, getattr(args, "batch_flush_ms", 20)) / 1000.0
+        self.batching = self.batch_n > 1 and self.codec_id != CODEC_NONE
 
     # -- setup ------------------------------------------------------------
 
@@ -702,13 +799,42 @@ class Gateway:
 
     def on_local_datagram(self, session: Session, data: bytes):
         """A datagram arrived from the local JackTrip process for this session."""
-        codec_id, flags, wire = compress_datagram(
-            data, self.codec, self.codec_id, self._debug_ctr, self.debug_headers_n
-        )
+        if self.debug_headers_n and self._debug_ctr[0] < self.debug_headers_n:
+            print(f"[debug-header] #{self._debug_ctr[0]} {hexdump16(data[:JACKTRIP_HEADER_LEN])}", file=sys.stderr, flush=True)
+            self._debug_ctr[0] += 1
+
+        if self.batching:
+            ok, fmt = cross_check_datagram(data)
+            if ok and fmt is not None:
+                # Same-format audio packet: accumulate. Flush first if the
+                # running batch has a different format (channels/depth changed).
+                if session.batch and session.batch_fmt is not None and (
+                    fmt.channels != session.batch_fmt.channels
+                    or fmt.bytes_per_sample != session.batch_fmt.bytes_per_sample
+                    or fmt.buffer_size != session.batch_fmt.buffer_size
+                ):
+                    self._flush_batch(session)
+                if not session.batch:
+                    session.batch_fmt = fmt
+                    self._schedule_batch_flush(session)
+                session.batch.append(data)
+                if len(session.batch) >= self.batch_n:
+                    self._flush_batch(session)
+                self.stats.maybe_report()
+                return
+            # Non-audio (handshake/control): flush any pending batch first to
+            # preserve ordering, then relay this one immediately.
+            self._flush_batch(session)
+
+        self._send_single(session, data)
+        self.stats.maybe_report()
+
+    def _send_single(self, session: Session, data: bytes):
+        codec_id, flags, wire = compress_datagram(data, self.codec, self.codec_id)
         frame = build_tunnel_frame(codec_id, flags, session.port_tag, len(data), wire)
         if self.tunnel_transport and self.peer_tunnel_addr:
             self.tunnel_transport.sendto(frame, self.peer_tunnel_addr)
-            self.stats.record(len(data), len(frame), bool(flags & FLAG_PASSTHROUGH) and codec_id == CODEC_NONE and self.codec_id != CODEC_NONE)
+            self.stats.record(len(data), len(frame), bool(flags & FLAG_PASSTHROUGH) and self.codec_id != CODEC_NONE)
         else:
             print(
                 f"[warn] dropping local datagram for session {session.port_tag}: "
@@ -716,7 +842,45 @@ class Gateway:
                 f"peer_tunnel_addr={self.peer_tunnel_addr})",
                 file=sys.stderr,
             )
-        self.stats.maybe_report()
+
+    def _schedule_batch_flush(self, session: Session):
+        if session.batch_timer is not None:
+            session.batch_timer.cancel()
+        session.batch_timer = self._loop.call_later(self.batch_flush_s, self._flush_batch, session)
+
+    def _flush_batch(self, session: Session):
+        if session.batch_timer is not None:
+            session.batch_timer.cancel()
+            session.batch_timer = None
+        if not session.batch:
+            return
+        datagrams = session.batch
+        fmt = session.batch_fmt
+        session.batch = []
+        session.batch_fmt = None
+        if not (self.tunnel_transport and self.peer_tunnel_addr):
+            print(
+                f"[warn] dropping {len(datagrams)}-packet batch for session {session.port_tag}: "
+                f"tunnel peer not known yet",
+                file=sys.stderr,
+            )
+            return
+        try:
+            frame = build_batch_frame(self.codec_id, session.port_tag, datagrams, fmt, self.codec)
+        except CodecError as exc:
+            # Codec failed on the batch: fall back to sending each datagram
+            # individually (passthrough within _send_single on its own retry).
+            print(f"[warn] batch encode failed ({exc}); sending {len(datagrams)} packets individually", file=sys.stderr)
+            for d in datagrams:
+                self._send_single(session, d)
+            return
+        raw_total = sum(len(d) for d in datagrams)
+        self.tunnel_transport.sendto(frame, self.peer_tunnel_addr)
+        # Attribute the whole batch to the stats counters: N packets, raw
+        # bytes = sum of datagram sizes, wire bytes = the single frame.
+        self.stats.packets_relayed += len(datagrams)
+        self.stats.bytes_in += raw_total
+        self.stats.bytes_out += len(frame)
 
     def on_tunnel_datagram(self, frame: bytes, addr):
         """A frame arrived from the peer gateway over the tunnel."""
@@ -734,28 +898,36 @@ class Gateway:
         if session is None:
             print(f"[warn] tunnel frame for unknown session tag={port_tag}, dropping", file=sys.stderr)
             return
-        try:
-            data = decompress_datagram(codec_id, flags, orig_len, wire, self.codec_by_id)
-        except CodecError as exc:
-            print(f"[warn] decode failed for session {port_tag}: {exc}", file=sys.stderr)
-            return
+        # A frame carries either one datagram or a batch of N; normalize to a
+        # list so the transport-ready / buffering logic below is shared.
+        if flags & FLAG_BATCH:
+            datagrams = parse_batch_frame(codec_id, wire, self.codec_by_id)
+            if datagrams is None:
+                print(f"[warn] malformed batch frame for session {port_tag}, dropping", file=sys.stderr)
+                return
+        else:
+            try:
+                datagrams = [decompress_datagram(codec_id, flags, orig_len, wire, self.codec_by_id)]
+            except CodecError as exc:
+                print(f"[warn] decode failed for session {port_tag}: {exc}", file=sys.stderr)
+                return
         transport = self._local_transports.get(port_tag)
         if transport is None:
             # Session is known but its local UDP transport hasn't finished
             # opening yet (asynchronous bind still in flight). Buffer the
-            # frame instead of dropping it outright so the very first
-            # relayed packet(s) of a new session -- which JackTrip's
-            # two-stage first-packet handshake can be sensitive to -- aren't
-            # silently lost; _open_local_udp_for_session flushes this queue
-            # once the transport is ready.
+            # datagrams instead of dropping them so the very first relayed
+            # packet(s) of a new session -- which JackTrip's two-stage
+            # first-packet handshake can be sensitive to -- aren't silently
+            # lost; _open_local_udp_for_session flushes this queue once ready.
             pending = self._pending_local_frames.setdefault(port_tag, [])
-            pending.append(data)
+            pending.extend(datagrams)
             print(
                 f"[warn] no local udp transport yet for session {port_tag}, buffering ({len(pending)} pending)",
                 file=sys.stderr,
             )
             return
-        self._forward_to_local_transport(session, transport, data)
+        for data in datagrams:
+            self._forward_to_local_transport(session, transport, data)
 
     def _forward_to_local_transport(self, session: Session, transport: asyncio.DatagramTransport, data: bytes) -> None:
         if session.local_peer_addr is not None:
@@ -771,6 +943,10 @@ class Gateway:
         """Close all sockets owned by this gateway on shutdown, so sessions
         are torn down in an orderly way rather than left to event-loop
         teardown (which emits ResourceWarning: unclosed transport noise)."""
+        for session in self.sessions.values():
+            if session.batch_timer is not None:
+                session.batch_timer.cancel()
+                session.batch_timer = None
         for t in self._open_udp_tasks:
             t.cancel()
         for transport in self._local_transports.values():
@@ -798,6 +974,8 @@ def parse_args(argv=None):
     p.add_argument("--jacktrip-tcp-port", type=int, default=4464, help="(hub role) TCP port of the real local JackTrip hub")
     p.add_argument("--codec", choices=["none", "zlib", "wavpack"], default="zlib")
     p.add_argument("--wavpack-lib", default=None, help="path to wavpackdll.dll / libwavpack.so (overrides GATEWAY_WAVPACK_LIB env var)")
+    p.add_argument("--batch", type=int, default=1, metavar="N", help="compress N same-format audio packets together per tunnel frame (1=per-packet, ~no compression; ~16 recommended, see stage2 doc sec.5.1). Ignored with --codec none.")
+    p.add_argument("--batch-flush-ms", type=int, default=20, metavar="MS", help="flush a partial batch after this many ms if it has not reached --batch size (bounds added latency when the stream slows/stops)")
     p.add_argument("--debug-headers", type=int, default=0, metavar="N", help="hex-dump the first N relayed packet headers (16 bytes) to stderr")
     args = p.parse_args(argv)
 

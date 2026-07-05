@@ -314,6 +314,67 @@ def test_header_passthrough() -> bool:
 
 
 # ---------------------------------------------------------------------
+# 5. Batch frame round-trip (build_batch_frame / parse_batch_frame)
+# ---------------------------------------------------------------------
+
+
+def _make_datagram(seq, buffer_size, channels, bps, kind, gen):
+    header = struct.pack(
+        gw.JACKTRIP_HEADER_FMT,
+        0x1122334455667788 + seq,  # TimeStamp (varies per packet)
+        seq & 0xFFFF,              # SeqNumber
+        buffer_size,
+        7,                         # SamplingRate enum
+        bps * 8,                   # BitResolution
+        channels,
+        0,                         # OutgoingChannels (0 -> effective = incoming)
+    )
+    payload = gen(buffer_size * channels, kind, seed=seq * 7919 + hash(kind) % 997)
+    return header + payload
+
+
+def run_batch_roundtrip_suite(codec_name: str, wavpack_lib: str = None) -> bool:
+    try:
+        codec = gwcodecs.make_codec(codec_name, wavpack_lib=wavpack_lib)
+    except gwcodecs.CodecError as exc:
+        record(f"batch:{codec_name} availability", SKIP, str(exc))
+        return True
+    codec_id = gw.CODEC_ID_BY_NAME[codec_name]
+    codec_by_id = {
+        gw.CODEC_NONE: gwcodecs.make_codec("none"),
+        gw.CODEC_ZLIB: gwcodecs.make_codec("zlib"),
+    }
+    codec_by_id[codec_id] = codec
+
+    buffer_size, channels = 128, 2
+    configs = [("int24", 3, gen_int24_samples), ("float32", 4, gen_float32_samples)]
+    all_ok = True
+    for fmt_name, bps, gen in configs:
+        fmt = gwcodecs.PayloadFormat(bytes_per_sample=bps, channels=channels, buffer_size=buffer_size)
+        for N in (2, 16, 64):
+            for kind in ("random", "sine", "silence"):
+                datagrams = [_make_datagram(s, buffer_size, channels, bps, kind, gen) for s in range(N)]
+                frame = gw.build_batch_frame(codec_id, 0xABCD, datagrams, fmt, codec)
+                parsed = gw.parse_tunnel_frame(frame)
+                ok = parsed is not None and (parsed[1] & gw.FLAG_BATCH)
+                if ok:
+                    out = gw.parse_batch_frame(parsed[0], parsed[4], codec_by_id)
+                    ok = out == datagrams  # bit-exact split-back of every datagram
+                if not ok:
+                    all_ok = False
+                record(
+                    f"batch roundtrip codec={codec_name} {fmt_name} N={N} {kind}",
+                    PASS if ok else FAIL,
+                    "" if ok else "split-back mismatch",
+                )
+    # malformed batch body must be rejected, not crash
+    ok_bad = gw.parse_batch_frame(gw.CODEC_ZLIB, b"\x00", codec_by_id) is None
+    record("batch frame rejects truncated body", PASS if ok_bad else FAIL)
+    all_ok = all_ok and ok_bad
+    return all_ok
+
+
+# ---------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------
 
@@ -338,6 +399,10 @@ def main() -> int:
 
     print("\n-- 4. header passthrough --")
     ok &= test_header_passthrough()
+
+    print("\n-- 5. batch frame round-trip (split-back bit-exact) --")
+    ok &= run_batch_roundtrip_suite("zlib")
+    ok &= run_batch_roundtrip_suite("wavpack", wavpack_lib=wavpack_lib)
 
     print("\n=== summary ===")
     n_pass = sum(1 for _, s, _ in _results if s == PASS)
