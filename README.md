@@ -3,7 +3,7 @@
 [SelfMatrix](https://github.com/zoobookfool/selfmatrix) (Matrix ベースの Discord 代替) 向けの、**本体とは結合しない独立した拡張モジュール**です。JackTrip (hub mode) で 192kHz/24bit の非圧縮ステレオ音声を VPS 中継します。
 
 - 本体 (Synapse / LiveKit / クライアント fork) には一切依存しません。有効化しなくても SelfMatrix の通話・チャットは通常どおり動作しますし、SelfMatrix を使っていなくても単体で使えます。
-- 要件の正本はこのリポジトリの [docs/requirements.md](docs/requirements.md) (2026-07-06 ゼロベース再定義) です。設計・実装の判断はこのドキュメントを基準にしてください。スパイク記録 (実測値・調査事実の一次資料) は親プロジェクトの [docs/hires-spike.md](https://github.com/zoobookfool/selfmatrix/blob/main/docs/hires-spike.md) を参照してください。
+- 要件の正本はこのリポジトリの [docs/requirements.md](docs/requirements.md) (2026-07-06 ゼロベース再定義) です。設計・実装の判断はこのドキュメントを基準にしてください。スパイク記録 (実測値・調査事実の一次資料) は親プロジェクトの [docs/hires-spike.md](https://github.com/zoobookfool/selfmatrix-workspace/blob/main/hires-spike.md) を参照してください。
 
 ## 1. これは何か
 
@@ -154,7 +154,7 @@ powershell -File launcher\connect.ps1 -DryRun
 
 ### 5.2 人数上限とその理由
 
-192kHz/24bit ステレオの非圧縮 PCM は 1 人あたり上り/下りそれぞれ約 9.8Mbps 消費します (実測値、[親プロジェクトのスパイク記録](https://github.com/zoobookfool/selfmatrix/blob/main/docs/hires-spike.md) 参照)。VPS の回線帯域 (多くの共有 VPS プランで 100Mbps 程度) を踏まえ、**既定の上限は同時 6 人**です (`--max-clients` で調整可能ですが、回線容量以上には増やさないでください)。
+192kHz/24bit ステレオの非圧縮 PCM は 1 人あたり上り/下りそれぞれ約 9.8Mbps 消費します (実測値、[親プロジェクトのスパイク記録](https://github.com/zoobookfool/selfmatrix-workspace/blob/main/hires-spike.md) 参照)。VPS の回線帯域 (多くの共有 VPS プランで 100Mbps 程度) を踏まえ、**既定の上限は同時 6 人**です (`--max-clients` で調整可能ですが、回線容量以上には増やさないでください)。
 
 また、**ハイレゾ hub は同時 1 セッションのみ** (サーバー全体でミックスは 1 つ) を前提にしています。JackTrip hub は接続者全員が同じミックスに入る構造であることに加え、上記の帯域試算のとおり複数セッションを並走させる回線余裕が無いためです。どうしても複数セッションが必要になった場合は `--bind-port` を変えて hub を増設できますが、回線増強とセットで判断してください。
 
